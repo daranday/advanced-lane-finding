@@ -13,7 +13,7 @@ from utils import (PROJECT_DIR, OUTPUT_DIR, CALIBRATION_DIR, create_dirs,
                    OpencvClicker)
 
 import logging
-log_format = '[%(asctime)s][%(name)s][%(levelname)s][%(message)s]'
+log_format = '[%(asctime)s][%(name)s][%(levelname)s] %(message)s'
 logging.basicConfig(level=logging.DEBUG, format=log_format)
 logger = logging.getLogger(__name__)
 
@@ -78,20 +78,23 @@ class ImageThresholder(object):
 class LaneLineFinder(object):
     """docstring for LaneLineFinder"""
 
-    def find(self, binary_warped, M, undist):
-        # Assuming you have created a warped binary image called "binary_warped"
-        # Take a histogram of the bottom half of the image
-        histogram = np.sum(
-            binary_warped[binary_warped.shape[0] // 2:, :], axis=0)
-        # Create an output image to draw on and  visualize the result
-        out_img = np.dstack(
-            (binary_warped, binary_warped, binary_warped)) * 255
-        # Find the peak of the left and right halves of the histogram
-        # These will be the starting point for the left and right lines
-        midpoint = np.int(histogram.shape[0] / 2)
-        leftx_base = np.argmax(histogram[:midpoint])
-        rightx_base = np.argmax(histogram[midpoint:]) + midpoint
+    def __init__(self):
+        self.leftx_base = None
+        self.rightx_base = None
+        self.debug_img = None
 
+    def initialize_upward_search(self, binary_img):
+        """Find starting points from peaks of bottom histogram."""
+        h, w = binary_img.shape
+        bottom_histogram = np.sum(binary_img[h // 2:, :], axis=0)
+        midpoint = np.int(bottom_histogram.shape[0] / 2)
+        self.leftx_base = np.argmax(bottom_histogram[:midpoint])
+        self.rightx_base = np.argmax(bottom_histogram[midpoint:]) + midpoint
+        self.debug_img = binary_img[..., np.newaxis].repeat(3, axis=2) * 255
+
+    def find(self, binary_warped, M, undist):
+        # Begin by choosing two starting points from lower half of image.
+        self.initialize_upward_search(binary_warped)
         # Choose the number of sliding windows
         nwindows = 9
         # Set height of windows
@@ -101,8 +104,8 @@ class LaneLineFinder(object):
         nonzeroy = np.array(nonzero[0])
         nonzerox = np.array(nonzero[1])
         # Current positions to be updated for each window
-        leftx_current = leftx_base
-        rightx_current = rightx_base
+        leftx_current = self.leftx_base
+        rightx_current = self.rightx_base
         # Set the width of the windows +/- margin
         margin = 100
         # Set minimum number of pixels found to recenter window
@@ -121,9 +124,9 @@ class LaneLineFinder(object):
             win_xright_low = rightx_current - margin
             win_xright_high = rightx_current + margin
             # Draw the windows on the visualization image
-            cv2.rectangle(out_img, (win_xleft_low, win_y_low),
+            cv2.rectangle(self.debug_img, (win_xleft_low, win_y_low),
                           (win_xleft_high, win_y_high), (0, 255, 0), 2)
-            cv2.rectangle(out_img, (win_xright_low, win_y_low),
+            cv2.rectangle(self.debug_img, (win_xright_low, win_y_low),
                           (win_xright_high, win_y_high), (0, 255, 0), 2)
             # Identify the nonzero pixels in x and y within the window
             good_left_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) & (
@@ -163,8 +166,8 @@ class LaneLineFinder(object):
         right_fitx = right_fit[0] * ploty**2 + \
             right_fit[1] * ploty + right_fit[2]
 
-        out_img[lefty, leftx] = [255, 0, 0]
-        out_img[righty, rightx] = [0, 0, 255]
+        self.debug_img[lefty, leftx] = [255, 0, 0]
+        self.debug_img[righty, rightx] = [0, 0, 255]
 
         # Create an image to draw the lines on
         warp_zero = np.zeros_like(binary_warped).astype(np.uint8)
@@ -192,8 +195,8 @@ class LaneLineFinder(object):
                               leftx * x_m_per_pixel, 2)
         right_fit = np.polyfit(righty * y_m_per_pixel,
                                rightx * x_m_per_pixel, 2)
-        print('left_fit', left_fit)
-        print('right_fit', right_fit)
+        logger.info('left_fit {}'.format(left_fit))
+        logger.info('right_fit {}'.format(right_fit))
         # Generate x and y values for plotting
         y_eval = binary_warped.shape[0]
         left_curverad = (
@@ -205,12 +208,13 @@ class LaneLineFinder(object):
         if right_curverad < 100:
             raise Exception()
 
-        cv2.putText(out_img, 'Left Curvature Radius: {:.2f} m'.format(
+        cv2.putText(lane_area_img, 'Left Curvature Radius: {:.2f} m'.format(
             left_curverad), (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, RED, 1)
-        cv2.putText(out_img, 'Right Curvature Radius: {:.2f} m'.format(
+        cv2.putText(lane_area_img, 'Right Curvature Radius: {:.2f} m'.format(
             right_curverad), (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, RED, 1)
 
-        return out_img
+        lane_area_img = lane_area_img[..., ::-1]
+        return lane_area_img
 
 
 class LaneDetector(object):
@@ -247,10 +251,11 @@ class LaneDetector(object):
             logger.error('Lane finding failed.')
             return
 
-        canvas = np.vstack([
-            np.hstack([frame, self.lanes_img]),
+        # canvas = np.vstack([
+        #     np.hstack([frame, self.lanes_img]),
             # np.hstack([gray_warped, lanes_img]),
-        ])
+        # ])
+        canvas = self.lanes_img
         cv2.imshow(basename(self.video_path), canvas)
         self.output_frames.append(canvas[..., ::-1])
 
@@ -263,21 +268,28 @@ class LaneDetector(object):
         elif button == 's':
             save_path = join(self.debug_dir, 'frame_{}.jpg'.format(frame_i))
             cv2.imwrite(save_path, frame)
-            print('[i] Successfully saved frame to', save_path)
+            logger.info('[i] Successfully saved frame to {}'.format(save_path))
 
     def process_video(self, video_path):
         self.paused = 0
         self.video_path = video_path
-        print(video_path)
+        logger.info(video_path)
         clip = VideoFileClip(video_path)
         for i, rgb_frame in enumerate(clip.iter_frames()):
             self.process_frame(i, rgb_frame)
 
     def detect(self, video_path):
-        self.process_video(video_path)
-        video = ImageSequenceClip(self.output_frames, fps=30)
-        video.write_videofile(join(OUTPUT_DIR, 'output.mp4'), fps=30,
-                              codec='mpeg4')
+        try:
+            self.output_frames = np.load('output_frames.npy')
+            self.output_frames = [self.output_frames[i] for i in range(self.output_frames.shape[0])]
+        except:
+            self.process_video(video_path)
+            np.save('output_frames.npy', self.output_frames)
+        video = ImageSequenceClip(self.output_frames, fps=20)
+        video.write_videofile(join(OUTPUT_DIR, 'output.avi'), fps=20,
+                              codec='png'
+                              # bitrate='64k',
+                              )
 
 
 if __name__ == '__main__':
